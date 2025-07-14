@@ -2,7 +2,6 @@
 
 #define DEBOUNCE_DELAY 30 // 스위치 민감도 조정
 
-// --- 주변 장치 및 핀 설정 ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 //l928n 모터 드라이버 모듈 IN1 HIGH일떄 IN2는 LOW 
 // 출력 핀l298n2_IN2
