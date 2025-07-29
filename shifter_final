@@ -1,106 +1,259 @@
 #include <LiquidCrystal_I2C.h>
 
-#define DEBOUNCE_DELAY 10
+#define DEBOUNCE_DELAY 30 // 디바운스 지연 시간 조정
 
+// --- 주변 장치 및 핀 설정 ---
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-const byte fuelCutPin = 5; 
-const byte shiftUpPin = 6;
-const byte shiftDownPin = 7;
-const byte l298n2_IN2 = 9;
+// 출력 핀
+const byte fuelCutPin       = 5;
+const byte shiftUpPin       = 6;
+const byte shiftDownPin     = 7;
+const byte l298n2_IN2       = 3;
+const byte l298n2_IN4       = 4;
+const byte wingMotorPinA    = 13; // 비활성화
+const byte wingMotorPinB    = 13;
+const byte wingMotorEN      = 13;
 
-const byte gearResetButton     = 0;
-const byte shiftUpButton       = 1;
-const byte shiftUpIdleButton   = 2;
-const byte shiftDownButtonPin  = 3;
-const byte shiftDownIdleButton = 4;
+// 입력 핀 (버튼)
+const byte gearResetButtonPin     = 8;
+const byte shiftUpButtonPin       = 9;
+const byte shiftUpIdleButtonPin   = 10;
+const byte shiftDownButtonPin     = 11;
+const byte shiftDownIdleButtonPin = 12;
 
-const byte wingMotorPinA = 11;
-const byte wingMotorPinB = 12;
-const byte wingMotorEN   = 13;
+// --- 상태 머신 정의 ---
+enum ShiftState {
+  S_IDLE,
+  S_UP_SHIFT_FUEL_CUT,
+  S_UP_SHIFT_CYLINDER_ACTIVE,
+  S_DOWN_SHIFT_ACTIVE,        // 수정됨: fuelcut 없는 다운쉬프트
+  S_IDLE_UP_SHIFT_ACTIVE,
+  S_IDLE_DOWN_SHIFT_ACTIVE
+};
+ShiftState currentShiftState = S_IDLE;
 
-int gearSequence[5] = {1, 0, 2, 3, 4}; 
+// --- Button 구조체 및 상태 변수 ---
+struct Button {
+  const byte pin;
+  bool lastReading;
+  bool debouncedState;
+  unsigned long lastDebounceTime;
+
+  Button(byte p) : pin(p), lastReading(HIGH), debouncedState(HIGH), lastDebounceTime(0) {}
+};
+
+Button gearResetButton(gearResetButtonPin);
+Button shiftUpButton(shiftUpButtonPin);
+Button shiftUpIdleButton(shiftUpIdleButtonPin);
+Button shiftDownButton(shiftDownButtonPin);
+Button shiftDownIdleButton(shiftDownIdleButtonPin);
+
+// --- 전역 변수 ---
 int gearIdx = 1;
 
-unsigned int fuelCutTime    = 0; 
+unsigned int fuelCutTime    = 0;
 unsigned int cylinderTime   = 0;
 unsigned int cylinderDelay  = 0;
-unsigned int updateLCDTime  = 500;
 
-unsigned long fuelCutStartTime       = 0;
-unsigned long cylinderStartTime      = 0;
-unsigned long cylinderDelayStartTime = 0;
-unsigned long cylinderDownStartTime  = 0;
-unsigned long updateLCDStartTime     = 0;
+unsigned long stateChangeTime     = 0;
+unsigned long lastLcdUpdateTime   = 0;
+const unsigned int updateLCDInterval = 500;
 
-bool fuelCutTimeOn   = false;
-bool cylinderOn      = false;
-bool cylinderDelayOn = false;
-bool cylinderOnDown  = false;
+// 리어윙 관련
+int speedValue       = 0;
+int speedThreshold   = 60;
+unsigned long wingMoveStartTime = 0;
+const unsigned long wingMoveDuration = 1000;
+bool wingIsUp    = false;
+bool wingMoving  = false;
+bool wingDirectionUp = false;
 
-bool prevShiftUpBtnState         = false;
-bool prevShiftUpIdleBtnState     = false;
-bool prevShiftDownBtnState       = false;
-bool prevShiftDownIdleBtnState   = false;
-bool currentShiftUpBtnState      = false;
-bool currentShiftUpIdleBtnState  = false;
-bool currentShiftDownBtnState    = false;
-bool currentShiftDownIdleBtnState = false;
+// 함수 선언
+void updateShiftController();
+bool wasPressed(Button &btn);
 
-bool ButtonDebounce(byte pin) {
-  static bool buttonState[20];
-  static bool lastReading[20];
-  static unsigned long lastDebounceTime[20]; 
+void setup() {
+  Serial.begin(9600);
 
-  bool reading = digitalRead(pin);
+  // LCD 초기화
+  lcd.begin();
+  lcd.backlight();
 
-  if (reading != lastReading[pin]) {
-    lastDebounceTime[pin] = millis();
-    lastReading[pin] = reading;
+  // 출력 핀 설정
+  pinMode(fuelCutPin, OUTPUT);
+  digitalWrite(fuelCutPin, HIGH);
+  pinMode(shiftUpPin, OUTPUT);
+  pinMode(shiftDownPin, OUTPUT);
+  pinMode(l298n2_IN2, OUTPUT);
+  pinMode(l298n2_IN4, OUTPUT);
+  pinMode(wingMotorPinA, OUTPUT);
+  pinMode(wingMotorPinB, OUTPUT);
+  pinMode(wingMotorEN, OUTPUT);
+  digitalWrite(wingMotorEN, HIGH);
+
+  // 입력 핀(풀업)
+  pinMode(gearResetButton.pin,     INPUT_PULLUP);
+  pinMode(shiftUpButton.pin,       INPUT_PULLUP);
+  pinMode(shiftUpIdleButton.pin,   INPUT_PULLUP);
+  pinMode(shiftDownButton.pin,     INPUT_PULLUP);
+  pinMode(shiftDownIdleButton.pin, INPUT_PULLUP);
+
+  stopCylinders();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // 아날로그 읽어서 0~150으로 매핑
+  fuelCutTime   = map(analogRead(A0), 0, 1023, 0, 150);
+  cylinderTime  = map(analogRead(A2), 0, 1023, 0, 150);
+  cylinderDelay = map(analogRead(A1), 0, 1023, 0, 150);
+
+  // 시리얼 입력(속도)
+  if (Serial.available() > 0) {
+    speedValue = Serial.parseInt();
+    controlRearWing(speedValue);
+    Serial.print("Input Speed: ");
+    Serial.println(speedValue);
   }
 
-  if ((millis() - lastDebounceTime[pin]) > DEBOUNCE_DELAY) {
-    buttonState[pin] = reading;
+  // 기어 리셋
+  if (wasPressed(gearResetButton)) {
+    gearIdx = 1;
+    Serial.println("Gear Reset → 1단");
   }
 
-  return buttonState[pin];
+  // 상태 머신
+  updateShiftController();
+
+  // 리어윙
+  updateWingMotor();
+
+  // LCD
+  if (currentTime - lastLcdUpdateTime >= updateLCDInterval) {
+    updateLCD();
+    lastLcdUpdateTime = currentTime;
+  }
+}
+
+void updateShiftController() {
+  unsigned long currentTime = millis();
+
+  switch (currentShiftState) {
+    case S_IDLE:
+      if (wasPressed(shiftUpButton)) {
+        Serial.println("ShiftUp: Fuel Cut 시작");
+        digitalWrite(fuelCutPin, LOW);
+        stopCylinders();
+        stateChangeTime = currentTime;
+        currentShiftState = S_UP_SHIFT_FUEL_CUT;
+      }
+      else if (wasPressed(shiftDownButton)) {
+        Serial.println("ShiftDown: 실린더 DOWN"); // 수정됨
+        shiftCylinderDown();                      // fuelcut 제거
+        stateChangeTime = currentTime;
+        currentShiftState = S_DOWN_SHIFT_ACTIVE;  // 수정됨
+      }
+      else if (wasPressed(shiftUpIdleButton)) {
+        Serial.println("Idle ShiftUp: 실린더 UP");
+        shiftCylinderUp();
+        stateChangeTime = currentTime;
+        currentShiftState = S_IDLE_UP_SHIFT_ACTIVE;
+      }
+      else if (wasPressed(shiftDownIdleButton)) {
+        Serial.println("Idle ShiftDown: 실린더 DOWN");
+        shiftCylinderDown();
+        stateChangeTime = currentTime;
+        currentShiftState = S_IDLE_DOWN_SHIFT_ACTIVE;
+      }
+      break;
+
+    case S_UP_SHIFT_FUEL_CUT:
+      if (currentTime - stateChangeTime >= cylinderDelay) {
+        Serial.println("ShiftUp: 실린더 UP");
+        shiftCylinderUp();
+        stateChangeTime = currentTime;
+        currentShiftState = S_UP_SHIFT_CYLINDER_ACTIVE;
+      }
+      break;
+
+    case S_UP_SHIFT_CYLINDER_ACTIVE:
+      if (currentTime - stateChangeTime >= cylinderTime) {
+        Serial.println("ShiftUp: 완료 → 기어 증가");
+        stopCylinders();
+        digitalWrite(fuelCutPin, HIGH);
+        gearIdx++;
+        currentShiftState = S_IDLE;
+      }
+      break;
+
+    case S_DOWN_SHIFT_ACTIVE: // 수정됨
+      if (currentTime - stateChangeTime >= cylinderTime) {
+        Serial.println("ShiftDown: 완료 → 기어 감소");
+        stopCylinders();
+        gearIdx--;
+        currentShiftState = S_IDLE;
+      }
+      break;
+
+    case S_IDLE_UP_SHIFT_ACTIVE:
+      if (currentTime - stateChangeTime >= cylinderTime) {
+        Serial.println("Idle ShiftUp: 완료 → 기어 증가");
+        stopCylinders();
+        gearIdx++;
+        currentShiftState = S_IDLE;
+      }
+      break;
+
+    case S_IDLE_DOWN_SHIFT_ACTIVE:
+      if (currentTime - stateChangeTime >= cylinderTime) {
+        Serial.println("Idle ShiftDown: 완료 → 기어 감소");
+        stopCylinders();
+        gearIdx--;
+        currentShiftState = S_IDLE;
+      }
+      break;
+  }
+}
+
+// Falling Edge 감지 (풀업 사용)
+bool wasPressed(Button &btn) {
+  bool oldState = btn.debouncedState;
+  bool reading  = digitalRead(btn.pin);
+
+  if (reading != btn.lastReading) {
+    btn.lastDebounceTime = millis();
+  }
+  if (millis() - btn.lastDebounceTime > DEBOUNCE_DELAY) {
+    btn.debouncedState = reading;
+  }
+  btn.lastReading = reading;
+
+  return (oldState == HIGH && btn.debouncedState == LOW);
 }
 
 void updateLCD() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("FuelCutTime:");
+  lcd.print("Fuel:");
   lcd.print(fuelCutTime);
   lcd.setCursor(0, 1);
   lcd.print("T:");
   lcd.print(cylinderTime);
-  lcd.setCursor(7,1);
-  lcd.print("D:");
+  lcd.print(" D:");
   lcd.print(cylinderDelay);
-  lcd.setCursor(13,1);
-  lcd.print("G:");
-  lcd.print(gearIdx);
 }
-
-int speedValue = 0;
-int speedThreshold = 60;
-unsigned long wingMoveStartTime = 0;
-const unsigned long wingMoveDuration = 1000;
-bool wingIsUp = false;
-bool wingMoving = false;
-bool wingDirectionUp = false;
 
 void controlRearWing(int spd) {
   if (wingMoving) return;
-
   if (spd >= speedThreshold && !wingIsUp) {
     digitalWrite(wingMotorPinA, HIGH);
     digitalWrite(wingMotorPinB, LOW);
     wingMoveStartTime = millis();
     wingMoving = true;
     wingDirectionUp = true;
-  } 
-  else if (spd < speedThreshold && wingIsUp) {
+  } else if (spd < speedThreshold && wingIsUp) {
     digitalWrite(wingMotorPinA, LOW);
     digitalWrite(wingMotorPinB, HIGH);
     wingMoveStartTime = millis();
@@ -120,172 +273,20 @@ void updateWingMotor() {
 
 void shiftCylinderUp() {
   digitalWrite(shiftUpPin, HIGH);
+  digitalWrite(l298n2_IN2, LOW);
+  Serial.println("실린더 UP");
 }
 
 void shiftCylinderDown() {
   digitalWrite(shiftDownPin, HIGH);
-  digitalWrite(l298n2_IN2, LOW);
+  digitalWrite(l298n2_IN4, LOW);
+  Serial.println("실린더 DOWN");
 }
 
 void stopCylinders() {
   digitalWrite(shiftUpPin, LOW);
   digitalWrite(shiftDownPin, LOW);
   digitalWrite(l298n2_IN2, LOW);
-}
-
-void setup() {
-  pinMode(fuelCutPin, OUTPUT);
-  digitalWrite(fuelCutPin, HIGH); // 평소에는 전류 흐름 ON
-
-  pinMode(shiftUpPin, OUTPUT);
-  pinMode(shiftDownPin, OUTPUT);
-  pinMode(l298n2_IN2, OUTPUT);
-
-  pinMode(wingMotorPinA, OUTPUT);
-  pinMode(wingMotorPinB, OUTPUT);
-  digitalWrite(wingMotorPinA, LOW);
-  digitalWrite(wingMotorPinB, LOW);
-  digitalWrite(wingMotorEN, HIGH);
-
-  pinMode(gearResetButton,      INPUT_PULLUP);
-  pinMode(shiftUpButton,        INPUT_PULLUP);
-  pinMode(shiftUpIdleButton,    INPUT_PULLUP);
-  pinMode(shiftDownButtonPin,   INPUT_PULLUP);
-  pinMode(shiftDownIdleButton,  INPUT_PULLUP);
-  stopCylinders();
-  lcd.begin();
-  lcd.backlight();
-  Serial.begin(9600);
-
-  prevShiftUpBtnState        = ButtonDebounce(shiftUpButton);
-  prevShiftUpIdleBtnState    = ButtonDebounce(shiftUpIdleButton);
-  prevShiftDownBtnState      = ButtonDebounce(shiftDownButtonPin);
-  prevShiftDownIdleBtnState  = ButtonDebounce(shiftDownIdleButton);
-}
-
-void loop() {
-  unsigned long currentMillis = millis();
-
-  if (ButtonDebounce(gearResetButton) == LOW) {
-    gearIdx = 1;
-    Serial.println("Gear Reset: 1단으로 변경됨");
-    delay(300);
-  }
-
-  if (Serial.available() > 0) {
-    speedValue = Serial.parseInt(); 
-    controlRearWing(speedValue);
-    Serial.print("Input Speed: ");
-    Serial.println(speedValue);
-  }
-
-  updateWingMotor();
-
-  fuelCutTime   = analogRead(A0);
-  cylinderTime  = analogRead(A1);
-  cylinderDelay = analogRead(A2);
-
-  if (currentMillis - updateLCDStartTime >= updateLCDTime){
-    updateLCD();
-    updateLCDStartTime = currentMillis;
-  }
-
-  currentShiftUpBtnState       = ButtonDebounce(shiftUpButton);
-  currentShiftUpIdleBtnState   = ButtonDebounce(shiftUpIdleButton);
-  currentShiftDownBtnState     = ButtonDebounce(shiftDownButtonPin);
-  currentShiftDownIdleBtnState = ButtonDebounce(shiftDownIdleButton);
-
-  if (prevShiftUpBtnState == HIGH && currentShiftUpBtnState == LOW && gearIdx < 4) {
-    Serial.println("ShiftUp 버튼 눌림");
-    digitalWrite(fuelCutPin, LOW); // 전류 차단
-    fuelCutTimeOn = true;
-    fuelCutStartTime = currentMillis;
-    Serial.println("Fuel Cut ON (전류 차단)");
-    stopCylinders();
-    cylinderDelayOn = true;
-    cylinderDelayStartTime = currentMillis;
-  }
-
-  if (fuelCutTimeOn && currentMillis - fuelCutStartTime >= fuelCutTime) {
-    digitalWrite(fuelCutPin, HIGH); // 다시 전류 흐름
-    fuelCutTimeOn = false;
-    Serial.println("Fuel Cut OFF (전류 흐름)");
-  }
-
-  if (cylinderDelayOn && currentMillis - cylinderDelayStartTime >= cylinderDelay) {
-    shiftCylinderUp();
-    Serial.println("ShiftCylinderUp() 호출됨");
-    cylinderOn = true;
-    cylinderStartTime = currentMillis;
-    cylinderDelayOn = false;
-  }
-
-  if (cylinderOn && currentMillis - cylinderStartTime >= cylinderTime) {
-    stopCylinders();
-    cylinderOn = false;
-    if (gearIdx < 4) gearIdx++;
-    Serial.println("UpShift 완료, 기어 증가");
-    Serial.print("Gear: ");
-    Serial.println(gearIdx);
-  }
-
-  if (prevShiftUpIdleBtnState == HIGH && currentShiftUpIdleBtnState == LOW && gearIdx < 4) {
-    Serial.println("ShiftUpIdle 버튼 눌림");
-    shiftCylinderUp();
-    Serial.println("ShiftCylinderUp() 호출됨 (Idle)");
-    cylinderOn = true;
-    cylinderStartTime = currentMillis;
-  }
-
-  if (cylinderOn && currentMillis - cylinderStartTime >= cylinderTime) {
-    stopCylinders();
-    cylinderOn = false;
-    if (gearIdx < 4) gearIdx++;
-    Serial.println("Idle UpShift 완료, 기어 증가");
-    Serial.print("Gear: ");
-    Serial.println(gearIdx);
-  }
-
-  if (prevShiftDownBtnState == HIGH && currentShiftDownBtnState == LOW && gearIdx > 0) {
-    Serial.println("ShiftDown 버튼 눌림");
-    digitalWrite(fuelCutPin, LOW);
-    fuelCutTimeOn = true;
-    fuelCutStartTime = currentMillis;
-    Serial.println("Fuel Cut ON (전류 차단)");
-    shiftCylinderDown();
-    Serial.println("ShiftCylinderDown() 호출됨");
-    cylinderOnDown = true;
-    cylinderDownStartTime = currentMillis;
-  }
-
-  if (cylinderOnDown && currentMillis - cylinderDownStartTime >= cylinderTime) {
-    stopCylinders();
-    cylinderOnDown = false;
-    if (gearIdx > 0) gearIdx--;
-    Serial.println("DownShift 완료, 기어 감소");
-    Serial.print("Gear: ");
-    Serial.println(gearIdx);
-  }
-
-  if (prevShiftDownIdleBtnState == HIGH && currentShiftDownIdleBtnState == LOW && gearIdx > 0) {
-    Serial.println("ShiftDownIdle 버튼 눌림");
-    shiftCylinderDown();
-    Serial.println("ShiftCylinderDown() 호출됨 (Idle)");
-    cylinderOnDown = true;
-    cylinderDownStartTime = currentMillis;
-  }
-
-  if (cylinderOnDown && currentMillis - cylinderDownStartTime >= cylinderTime) {
-    stopCylinders();
-    cylinderOnDown = false;
-    if (gearIdx > 0) gearIdx--;
-    Serial.println("Idle DownShift 완료, 기어 감소");
-    Serial.print("Gear: ");
-    Serial.println(gearIdx);
-  }
-
-  prevShiftUpBtnState        = currentShiftUpBtnState;
-  prevShiftUpIdleBtnState    = currentShiftUpIdleBtnState;
-  prevShiftDownBtnState      = currentShiftDownBtnState;
-  prevShiftDownIdleBtnState  = currentShiftDownIdleBtnState;
+  digitalWrite(l298n2_IN4, LOW);
+  Serial.println("실린더 STOP");
 }
